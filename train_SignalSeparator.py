@@ -1,7 +1,7 @@
 from load_dataset import SignalDataset
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
-from model_complex import SignalSeparator
+from model_diffusion import SignalSeparator
 import torch.optim as optim
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -74,7 +74,25 @@ def calculate_loss(output, batch_data):
     
     return loss1 + loss2
 
-def train_epoch(model, train_loader, optimizer, device):
+def get_diffusion_beta_schedule(T, beta_start=1e-4, beta_end=0.02):
+    """线性beta调度"""
+    return torch.linspace(beta_start, beta_end, T)
+
+def q_sample(x_0, t, noise, alphas_cumprod):
+    """
+    x_0: [batch, channel, length] 原始混合信号
+    t: [batch] 当前步数
+    noise: [batch, channel, length] 随机噪声
+    alphas_cumprod: [T] 累积alpha
+    """
+    # 获取每个样本的alpha_bar
+    device = x_0.device
+    batch_size = x_0.size(0)
+    alpha_bar = alphas_cumprod[t].reshape(batch_size, 1, 1)
+    return torch.sqrt(alpha_bar) * x_0 + torch.sqrt(1 - alpha_bar) * noise
+
+
+def train_epoch(model, train_loader, optimizer, device, T, alpha_cumprod):
     """训练一个epoch"""
     model.train()
     total_loss = 0.0
@@ -82,23 +100,48 @@ def train_epoch(model, train_loader, optimizer, device):
     for batch in progress_bar:
         batch_data = process_batch(batch, device)
         optimizer.zero_grad()
-        output = model(batch_data['mixsignal'])
-        loss = calculate_loss(output, batch_data)
+        
+        # 原始混合含噪信号
+        x_0 = torch.cat([batch_data['rfsignal1'], batch_data['rfsignal2']], dim=1)  # [batch, 4, L]
+        mixsignal = batch_data['mixsignal']  # [batch, 2, L]
+        batch_size = x_0.size(0)
+
+        # 随机采样时间步t
+        t = torch.randint(0, T, (batch_size,), device=device).long()
+
+        # 计算噪声
+        noise = torch.randn_like(x_0)
+
+        # 加噪
+        x_t = q_sample(x_0, t, noise, alpha_cumprod)
+
+        # 前向传播
+        output = model(x_t, t, mixsignal)
+        output = torch.cat(output, dim=1)
+
+        loss = torch.nn.functional.mse_loss(output, noise)
         loss.backward()
         optimizer.step()
         total_loss += loss.item()
         progress_bar.set_postfix({'loss': loss.item()})
     return total_loss / len(train_loader)
 
-def validate_epoch(model, val_loader, device):
+def validate_epoch(model, val_loader, device, T, alphas_cumprod):
     """验证一个epoch"""
     model.eval()
     total_loss = 0.0
     with torch.no_grad():
         for batch in val_loader:
             batch_data = process_batch(batch, device)
-            output = model(batch_data['mixsignal'])
-            loss = calculate_loss(output, batch_data)
+            x_0 = torch.cat([batch_data['rfsignal1'], batch_data['rfsignal2']], dim=1)  # [batch, 4, L]
+            mixsignal = batch_data['mixsignal']  # [batch, 2, L]
+            batch_size = x_0.size(0)
+            t = torch.randint(0, T, (batch_size,), device=device).long()
+            noise = torch.randn_like(x_0)
+            x_t = q_sample(x_0, t, noise, alphas_cumprod)
+            output = model(x_t, t, mixsignal)
+            output = torch.cat(output, dim=1)
+            loss = torch.nn.functional.mse_loss(output, noise)
             total_loss += loss.item()
     return total_loss / len(val_loader)
 
@@ -115,19 +158,17 @@ def plot_and_save_loss(train_losses, val_losses, save_path):
 
 def main():
     # 配置参数
-    mode_name = 'qpsk_all_params_10000'
+    mode_name = 'random_small'
     config = {
         'dataset_path': '/nas/datasets/yixin/PCMA/py_dataset',
         'mode': mode_name,
         'batch_size': 64,
-        'num_epochs': 50,
-        # 'save_path': './test/loss_SigSep_'+mode_name+'.png',
-        # 'model_save_path': 'signal_separator_'+mode_name+'.pth',
-        'save_path': './src/py_dataset/loss_SigSep_'+mode_name+'.png',
-        'model_save_path': 'signal_separator_'+mode_name+'.pth',
+        'num_epochs': 1000,
+        'save_path': './src/pics/loss_diffusion_'+mode_name+'.pdf',
+        'model_save_path': './src/models/diffusion_'+mode_name+'.pth',
         'initial_learning_rate': 5e-4
     }
-    selected_cuda = "1"
+    selected_cuda = "0"
     # 设备设置
     device = torch.device(f'cuda:{selected_cuda}' if torch.cuda.is_available() else 'cpu')
     print(f'Using device: {device}')
@@ -145,9 +186,16 @@ def main():
     # 训练循环
     train_losses = []
     val_losses = []
+
+    # 获取beta调度
+    T = 1000  # 时间步数
+    beta_schedule = get_diffusion_beta_schedule(T).to(device)
+    alphas = 1. - beta_schedule
+    alphas_cumprod = torch.cumprod(alphas, dim=0)
+
     for epoch in range(config['num_epochs']):
-        train_loss = train_epoch(model, train_loader, optimizer, device)
-        val_loss = validate_epoch(model, val_loader, device)
+        train_loss = train_epoch(model, train_loader, optimizer, device, T, alphas_cumprod)
+        val_loss = validate_epoch(model, val_loader, device, T, alphas_cumprod)
         
         print(f'Epoch {epoch+1}/{config["num_epochs"]}')
         print(f'Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}')

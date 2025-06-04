@@ -1,4 +1,4 @@
-from model_complex import SignalSeparator
+from model_diffusion import SignalSeparator
 import torch
 import time
 import numpy as np
